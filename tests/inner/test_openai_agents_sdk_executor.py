@@ -35,6 +35,7 @@ from omnigent.inner.openai_agents_sdk_executor import (
     _normalize_responses_items_for_chat,
     _ReasoningBlockFilterStream,
     _sanitize_replay_item,
+    _wrap_client_for_infinite_rate_limit_retries,
     _wrap_client_for_reasoning_models,
 )
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
@@ -418,6 +419,82 @@ def test_wrap_client_non_streaming_create_not_wrapped() -> None:
 
     result = _run(_run_inner())
     assert isinstance(result, _FakeResult)
+
+
+def test_openai_client_retries_429_until_success() -> None:
+    """A persistent provider throttle outlives the SDK's bounded retry budget."""
+
+    request = httpx.Request("POST", "https://gateway.test/chat/completions")
+    rate_limit = httpx.HTTPStatusError(
+        "rate limited",
+        request=request,
+        response=httpx.Response(429, request=request),
+    )
+
+    class _FakeCalls:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, **kwargs) -> str:
+            self.calls += 1
+            if self.calls < 3:
+                raise rate_limit
+            return str(kwargs["marker"])
+
+    class _FakeChat:
+        def __init__(self) -> None:
+            self.completions = _FakeCalls()
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = _FakeChat()
+            self.responses = _FakeCalls()
+
+    async def _run_inner() -> tuple[str, list[float], int]:
+        client = _FakeClient()
+        original = client.chat.completions
+        sleeps = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with patch("omnigent.inner.openai_agents_sdk_executor._sleep", fake_sleep):
+            _wrap_client_for_infinite_rate_limit_retries(client)
+            result = await client.chat.completions.create(marker="done")
+        return result, sleeps, original.calls
+
+    result, sleeps, calls = _run(_run_inner())
+    assert result == "done"
+    assert sleeps == [60.0, 60.0]
+    assert calls == 3
+
+
+def test_openai_client_does_not_retry_non_429() -> None:
+    """Authentication, quota configuration, and server errors remain bounded."""
+
+    request = httpx.Request("POST", "https://gateway.test/responses")
+    forbidden = httpx.HTTPStatusError(
+        "forbidden",
+        request=request,
+        response=httpx.Response(403, request=request),
+    )
+
+    class _FakeCalls:
+        async def create(self, **kwargs) -> None:
+            del kwargs
+            raise forbidden
+
+    class _FakeClient:
+        responses = _FakeCalls()
+
+    async def _run_inner() -> None:
+        client = _FakeClient()
+        _wrap_client_for_infinite_rate_limit_retries(client)
+        await client.responses.create()
+
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        _run(_run_inner())
+    assert caught.value.response.status_code == 403
 
 
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
@@ -1481,9 +1558,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
                 ),
                 patch(
                     "omnigent.runtime.live_usage.publish_live_usage",
-                    side_effect=lambda session_id, usage: published.append(
-                        (session_id, usage)
-                    ),
+                    side_effect=lambda session_id, usage: published.append((session_id, usage)),
                 ),
             ):
                 events = [

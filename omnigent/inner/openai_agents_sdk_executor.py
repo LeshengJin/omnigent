@@ -74,6 +74,15 @@ _EMPTY_TURN_MAX_ATTEMPTS = 2
 # retried.
 _NON_OUTPUT_ITEM_TYPES: frozenset[str] = frozenset({"reasoning_item", "compaction_item"})
 
+# The SDK performs its normal bounded retry burst first. A persistent TPM
+# throttle then gets a full window to drain before the identical HTTP request
+# is attempted again. ``asyncio.sleep`` keeps cancellation immediate.
+_RATE_LIMIT_COOLDOWN_S = 60.0
+
+
+async def _sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
 
 # Replay items persisted to the SDK Session — heterogeneous Responses-API
 # input items (function_call / function_call_output / message / etc.).
@@ -1001,6 +1010,66 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     return client
 
 
+def _rate_limit_retry_delay(error: Exception) -> float | None:
+    """Return the cooldown for an HTTP 429, or ``None`` for other errors."""
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) != 429:
+        return None
+    delay = _RATE_LIMIT_COOLDOWN_S
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        raw = headers.get("retry-after")
+        with contextlib.suppress(TypeError, ValueError):
+            delay = max(delay, float(raw)) if raw is not None else delay
+    return delay
+
+
+class _InfiniteRateLimitCalls:
+    """Retry one OpenAI resource's ``create`` call forever on HTTP 429."""
+
+    def __init__(self, calls: Any) -> None:  # type: ignore[explicit-any]
+        self._calls = calls
+
+    async def create(self, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        while True:
+            try:
+                return await self._calls.create(**kwargs)
+            except Exception as error:
+                delay = _rate_limit_retry_delay(error)
+                if delay is None:
+                    raise
+                logger.warning(
+                    "OpenAI request remained rate-limited after SDK retries; retrying in %.0fs",
+                    delay,
+                )
+                await _sleep(delay)
+
+    def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
+        return getattr(self._calls, name)
+
+
+class _InfiniteRateLimitChat:
+    """Expose rate-limit retries for ``chat.completions.create``."""
+
+    def __init__(self, chat: Any) -> None:  # type: ignore[explicit-any]
+        self._chat = chat
+        self.completions = _InfiniteRateLimitCalls(chat.completions)
+
+    def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
+        return getattr(self._chat, name)
+
+
+def _wrap_client_for_infinite_rate_limit_retries(
+    client: AsyncOpenAIClient,
+) -> AsyncOpenAIClient:
+    """Retry Responses and Chat Completions HTTP 429s until cancellation."""
+    if hasattr(client, "responses"):
+        object.__setattr__(client, "responses", _InfiniteRateLimitCalls(client.responses))
+    if hasattr(client, "chat"):
+        object.__setattr__(client, "chat", _InfiniteRateLimitChat(client.chat))
+    return client
+
+
 def _count_output_items(new_items: Sequence[object]) -> int:
     """Count run items that represent user-visible output.
 
@@ -1143,6 +1212,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                 model=model,
             )
         )
+        raw_client = _wrap_client_for_infinite_rate_limit_retries(raw_client)
         # Wrap the chat.completions path to strip list-type delta.content
         # (reasoning blocks emitted by models like Kimi K2).  The SDK's
         # ChatCmplStreamHandler validates delta as str; list input raises
