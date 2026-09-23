@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable, Generator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -143,6 +144,48 @@ _OPENAI_API_KEY_ENV_VAR = "OPENAI_API_KEY"
 _OPENAI_BASE_URL_ENV_VAR = "OPENAI_BASE_URL"
 _OPENAI_AGENTS_HARNESSES = frozenset({"openai-agents", "openai-agents-sdk"})
 _MATERIALIZED_OVERRIDE_DIRS: dict[Path, Path] = {}
+
+
+def _headless_json_payload(text: str | None, session: object) -> dict[str, object]:
+    """Build the stable machine-readable result for a headless one-shot run."""
+    raw_models = getattr(session, "usage_by_model", None)
+    models: dict[str, dict[str, int | float | None]] = {}
+    if isinstance(raw_models, Mapping):
+        for model, raw in raw_models.items():
+            if not isinstance(raw, Mapping):
+                continue
+            models[str(model)] = {
+                field: value if isinstance(value, (int, float)) else None
+                for field in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "total_cost_usd",
+                )
+                if (value := raw.get(field)) is not None
+            }
+
+    def total(field: str) -> int | None:
+        values = [entry.get(field) for entry in models.values()]
+        counted = [int(value) for value in values if isinstance(value, (int, float))]
+        return sum(counted) if counted else None
+
+    return {
+        "type": "result",
+        "session_id": str(getattr(session, "id", "")),
+        "text": text or "",
+        "usage": {
+            "input_tokens": total("input_tokens"),
+            "output_tokens": total("output_tokens"),
+            "total_tokens": total("total_tokens"),
+            "cache_read_input_tokens": total("cache_read_input_tokens"),
+            "cache_creation_input_tokens": total("cache_creation_input_tokens"),
+            "total_cost_usd": getattr(session, "total_cost_usd", None),
+            "models": models,
+        },
+    }
 
 
 def _default_cli_model() -> str:
@@ -501,6 +544,7 @@ def run_prompt(
     prompt: str,
     system_prompt: str | None = None,
     ephemeral: bool = False,
+    json_output: bool = False,
 ) -> None:
     """Run one prompt headlessly and print only the assistant text.
 
@@ -518,6 +562,8 @@ def run_prompt(
     :param system_prompt: CLI ``--system-prompt`` override for local targets.
     :param ephemeral: When ``True``, use a fresh per-run local
         server database and artifact directory.
+    :param json_output: Emit one JSON result carrying text, session id,
+        token usage, and priced cost instead of plain assistant text.
     """
     tool_handler = _load_tool_handler(client_tools) if client_tools else None
     overrides = ChatOverrides(
@@ -541,6 +587,7 @@ def run_prompt(
             agent_name,
             tool_handler,
             prompt=prompt,
+            json_output=json_output,
         )
         return
 
@@ -550,6 +597,7 @@ def run_prompt(
         overrides=overrides,
         prompt=prompt,
         ephemeral=ephemeral,
+        json_output=json_output,
     )
 
 
@@ -2258,6 +2306,7 @@ def _run_local_headless_prompt(
     overrides: ChatOverrides,
     prompt: str,
     ephemeral: bool = False,
+    json_output: bool = False,
 ) -> None:
     """
     Start a local server, run one prompt, print response, and stop.
@@ -2268,6 +2317,7 @@ def _run_local_headless_prompt(
     :param prompt: User prompt for the single turn.
     :param ephemeral: When ``True``, use a fresh per-run local
         server database and artifact directory.
+    :param json_output: Emit a machine-readable result rather than plain text.
     :returns: None.
     """
     path = Path(agent_path)
@@ -2296,6 +2346,7 @@ def _run_local_headless_prompt(
                 prompt=prompt,
                 runner_id=server.runner_id,
                 session_bundle=_bundle_agent(spec_path),
+                json_output=json_output,
             )
         finally:
             _stop_local_server(server)
@@ -2312,6 +2363,7 @@ def _run_headless_prompt(
     runner_id: str | None = None,
     session_bundle: bytes | None = None,
     session_bundle_filename: str = "agent.tar.gz",
+    json_output: bool = False,
 ) -> None:
     """
     POST one prompt through the SDK and print the final assistant text.
@@ -2330,6 +2382,7 @@ def _run_headless_prompt(
     :param session_bundle: Optional gzipped agent bundle bytes.
     :param session_bundle_filename: Multipart filename, e.g.
         ``"agent.tar.gz"``.
+    :param json_output: Emit a machine-readable result rather than plain text.
     :raises SystemExit: Exits with code 1 after printing the server
         error text when the stream emits ``response.error`` or
         returns ``ResponseFailed`` without output text.
@@ -2345,6 +2398,12 @@ def _run_headless_prompt(
             # Both a local bundle and a remote registered agent go through
             # the sessions API; _query_sessions_once picks the create route
             # from whether a bundle was supplied.
+            session_id = ""
+
+            def remember_session(ready: str) -> None:
+                nonlocal session_id
+                session_id = ready
+
             result_text = await _query_sessions_once(
                 client=client,
                 agent_name=agent_name,
@@ -2353,8 +2412,14 @@ def _run_headless_prompt(
                 session_bundle=session_bundle,
                 session_bundle_filename=session_bundle_filename,
                 runner_id=runner_id,
+                on_session_ready=remember_session,
             )
-            if result_text:
+            if json_output:
+                if not session_id:
+                    raise RuntimeError("headless run completed without a session id")
+                snapshot = await client.sessions.get(session_id)
+                print(json.dumps(_headless_json_payload(result_text, snapshot), sort_keys=True))
+            elif result_text:
                 print(result_text)
 
     try:

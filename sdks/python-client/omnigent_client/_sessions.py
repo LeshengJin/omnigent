@@ -170,6 +170,11 @@ class Session:
         output) from the most recently completed task, e.g. ``45231``.
         ``None`` when no task has completed yet. Used to seed the
         context-ring on resume without waiting for the next response.
+    :param total_cost_usd: Cumulative priced cost for this session's
+        subtree, or ``None`` when the model is unpriced or no usage was
+        reported.
+    :param usage_by_model: Cumulative token and cost buckets keyed by
+        harness-reported model id, or ``None`` when unavailable.
     :param last_task_error: Error details from the most recently failed
         task, e.g. ``{"code": "executor_error", "message": "..."}``
         ``None`` when no task has failed.
@@ -200,6 +205,8 @@ class Session:
     model_override: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
+    total_cost_usd: float | None = None
+    usage_by_model: dict[str, dict[str, int | float | None]] | None = None
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
@@ -218,6 +225,8 @@ class Session:
         labels_raw = raw.get("labels", {})
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
+        raw_cost = raw.get("total_cost_usd")
+        raw_usage = raw.get("usage_by_model")
         raw_updated_at = raw.get("updated_at")
         return cls(
             id=str(raw["id"]),
@@ -236,6 +245,13 @@ class Session:
             model_override=raw.get("model_override"),
             context_window=int(raw_cw) if raw_cw is not None else None,
             last_total_tokens=int(raw_ltt) if raw_ltt is not None else None,
+            total_cost_usd=float(raw_cost) if raw_cost is not None else None,
+            usage_by_model=(
+                raw_usage
+                if isinstance(raw_usage, dict)
+                and all(isinstance(value, dict) for value in raw_usage.values())
+                else None
+            ),
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
