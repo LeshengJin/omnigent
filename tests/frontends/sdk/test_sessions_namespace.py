@@ -266,6 +266,49 @@ async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_parses_usage_receipt() -> None:
+    """Session snapshots expose the server's cache-aware usage receipt."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json=_session_response_body()
+            | {
+                "total_cost_usd": 0.42,
+                "usage_by_model": {
+                    "databricks-glm-5-3": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "total_tokens": 150,
+                        "cache_read_input_tokens": 30,
+                        "cache_creation_input_tokens": 0,
+                        "total_cost_usd": 0.42,
+                    }
+                },
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.total_cost_usd == 0.42
+    assert session.usage_by_model == {
+        "databricks-glm-5-3": {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 150,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 0,
+            "total_cost_usd": 0.42,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_parses_agent_name() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

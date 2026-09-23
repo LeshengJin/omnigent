@@ -7855,6 +7855,7 @@ def _dispatch_run(
     server_from_cli: bool = False,
     model_from_cli: bool = False,
     acp_agent: AcpAgentEntry | None = None,
+    json_output: bool = False,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -7901,6 +7902,7 @@ def _dispatch_run(
         on the command line rather than loaded from config.
     :param acp_agent: Optional one-shot ACP agent carried in the generated
         temporary spec instead of loaded from global config.
+    :param json_output: Emit a JSON result for an ephemeral headless run.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
@@ -8111,6 +8113,7 @@ def _dispatch_run(
             prompt=prompt,
             system_prompt=system_prompt,
             ephemeral=ephemeral,
+            json_output=json_output,
         )
         return
 
@@ -8341,6 +8344,13 @@ def attach(
 )
 @click.option("--fork", "fork_session_id", default=None, help=_FORK_HELP)
 @click.option("--no-session", "ephemeral", is_flag=True, default=False, help=_NO_SESSION_HELP)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Emit a JSON result with token usage for a headless --no-session run.",
+)
 @click.option("--log/--no-log", "log", default=False, help=_LOG_HELP)
 @click.option(
     "--server",
@@ -8401,6 +8411,7 @@ def run(
     resume_latest: bool,
     fork_session_id: str | None,
     ephemeral: bool,
+    json_output: bool,
     log: bool,
     server: str | None,
     databricks_profile: str | None,
@@ -8449,6 +8460,8 @@ def run(
     from omnigent.runtime.telemetry import capture_dispatch_trace_context
 
     capture_dispatch_trace_context()
+    if json_output and (prompt is None or not ephemeral):
+        raise click.ClickException("--json requires -p/--prompt and --no-session")
     # Rejected before anything is resolved: `run` never routed in-harness, and
     # its create-time route is gone.
     if smart_routing:
@@ -8570,6 +8583,7 @@ def run(
         server_from_cli=server_from_cli,
         model_from_cli=model_from_cli,
         acp_agent=acp_agent,
+        json_output=json_output,
     )
 
 

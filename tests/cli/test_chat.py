@@ -831,6 +831,7 @@ def test_run_prompt_local_dispatches_headless_helper(
         overrides: chat_module.ChatOverrides,
         prompt: str,
         ephemeral: bool = False,
+        json_output: bool = False,
     ) -> None:
         """Record local headless dispatch inputs."""
         captured["agent_path"] = agent_path
@@ -838,6 +839,7 @@ def test_run_prompt_local_dispatches_headless_helper(
         captured["overrides"] = overrides
         captured["prompt"] = prompt
         captured["ephemeral"] = ephemeral
+        captured["json_output"] = json_output
 
     monkeypatch.setattr(chat_module, "_run_local_headless_prompt", _fake_headless)
 
@@ -846,6 +848,7 @@ def test_run_prompt_local_dispatches_headless_helper(
         None,
         prompt="hello",
         ephemeral=True,
+        json_output=True,
     )
 
     assert captured["agent_path"] == "tests/resources/examples/hello_world.yaml"
@@ -857,6 +860,7 @@ def test_run_prompt_local_dispatches_headless_helper(
     assert overrides.has_any is False
     assert captured["prompt"] == "hello"
     assert captured["ephemeral"] is True
+    assert captured["json_output"] is True
 
 
 def test_canonicalize_local_agent_path_promotes_root_config_yaml(tmp_path: Path) -> None:
@@ -1047,6 +1051,7 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
         prompt: str,
         runner_id: str | None = None,
         session_bundle: bytes | None = None,
+        json_output: bool = False,
     ) -> None:
         """Record one-shot prompt inputs instead of making an API call."""
         captured["headless"] = {
@@ -1056,6 +1061,7 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
             "prompt": prompt,
             "runner_id": runner_id,
             "session_bundle": session_bundle,
+            "json_output": json_output,
         }
 
     monkeypatch.setattr(chat_module, "_find_free_port", lambda: 34567)
@@ -1071,6 +1077,7 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
         overrides=ChatOverrides(),
         prompt="say hi",
         ephemeral=True,
+        json_output=True,
     )
 
     assert captured["server_spec_path"] == agent_dir
@@ -1082,6 +1089,50 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
     assert headless["prompt"] == "say hi"
     assert headless["runner_id"] == "runner_headless"
     assert headless["session_bundle"] == b"bundle-bytes"
+    assert headless["json_output"] is True
+
+
+def test_headless_json_payload_aggregates_usage() -> None:
+    """The headless receipt keeps cache buckets and authoritative cost."""
+    session = SimpleNamespace(
+        id="conv_123",
+        total_cost_usd=1.25,
+        usage_by_model={
+            "model-a": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "total_tokens": 20,
+                "cache_read_input_tokens": 5,
+                "cache_creation_input_tokens": 1,
+                "total_cost_usd": 0.5,
+            },
+            "model-b": {
+                "input_tokens": 30,
+                "output_tokens": 6,
+                "total_tokens": 40,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 2,
+                "total_cost_usd": 0.75,
+            },
+        },
+    )
+
+    payload = chat_module._headless_json_payload("done", session)
+
+    assert payload == {
+        "type": "result",
+        "session_id": "conv_123",
+        "text": "done",
+        "usage": {
+            "input_tokens": 40,
+            "output_tokens": 10,
+            "total_tokens": 60,
+            "cache_read_input_tokens": 12,
+            "cache_creation_input_tokens": 3,
+            "total_cost_usd": 1.25,
+            "models": session.usage_by_model,
+        },
+    }
 
 
 def test_chat_local_uses_directory_bundle_for_root_config_yaml(

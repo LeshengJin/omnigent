@@ -5753,6 +5753,35 @@ def test_run_headless_prompt_defaults_browser_open_off(
     assert dispatched["auto_open_conversation"] is False
 
 
+def test_run_json_requires_headless_ephemeral_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """JSON receipts are limited to one-shot ephemeral runs."""
+    _capture_run_dispatch(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli, ["run", "myagent.yaml", "--json"])
+
+    assert result.exit_code != 0
+    assert "--json requires -p/--prompt and --no-session" in result.output
+
+
+def test_run_json_is_forwarded_to_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A valid JSON receipt request reaches the one-shot dispatcher."""
+    dispatched = _capture_run_dispatch(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "myagent.yaml", "-p", "hi", "--no-session", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert dispatched["json_output"] is True
+
+
 def test_run_interactive_respects_explicit_opt_out(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
