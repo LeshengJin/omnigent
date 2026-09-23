@@ -87,6 +87,7 @@ from omnigent.entities import (
 from omnigent.errors import StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
+from omnigent.runtime.live_usage import publish_live_usage
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
@@ -1526,6 +1527,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_session_usage", write)
+        publish_live_usage(conversation_id, usage)
 
     def set_session_todos(
         self,
@@ -1641,11 +1643,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return current
 
-        return run_write_transaction(
+        current = run_write_transaction(
             self._session_immediate,
             "increment_session_usage",
             write,
         )
+        publish_live_usage(conversation_id, current)
+        return current
 
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """

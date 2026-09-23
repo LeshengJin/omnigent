@@ -104,6 +104,7 @@ class _FakeRunItemEvent:
 
 @dataclass
 class _FakeModelSettings:
+    include_usage: bool | None = None
     parallel_tool_calls: bool | None = None
     max_tokens: int | None = None
 
@@ -685,6 +686,29 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
             self.assertEqual(events[-1].response, "done")
             self.assertFalse(_FakeRunner.last_calls[0]["agent"].model_settings.parallel_tool_calls)
+
+        _run(_t())
+
+    def test_streamed_usage_is_requested_for_compatible_providers(self):
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "Be helpful.",
+                    )
+                ]
+
+            self.assertEqual(events[-1].response, "done")
+            self.assertTrue(_FakeRunner.last_calls[0]["agent"].model_settings.include_usage)
 
         _run(_t())
 
@@ -1425,6 +1449,60 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
                 1200,
                 "context_tokens must equal total for single-call turns.",
             )
+
+        _run(_t())
+
+    def test_completed_subcall_publishes_live_cumulative_usage(self):
+        """Usage is visible before the outer agent turn finishes."""
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            completed = types.SimpleNamespace(
+                type="response.completed",
+                response=types.SimpleNamespace(
+                    usage=types.SimpleNamespace(
+                        input_tokens=100,
+                        output_tokens=10,
+                        total_tokens=110,
+                        input_tokens_details=types.SimpleNamespace(cached_tokens=70),
+                    )
+                ),
+            )
+            _FakeRunner.next_result = _FakeResult(
+                events=[_FakeRawEvent(completed)],
+                final_output="done",
+            )
+            published: list[tuple[str, dict[str, object]]] = []
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with (
+                patch(
+                    "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                    return_value=_fake_agents_sdk(),
+                ),
+                patch(
+                    "omnigent.runtime.live_usage.publish_live_usage",
+                    side_effect=lambda session_id, usage: published.append(
+                        (session_id, usage)
+                    ),
+                ),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "",
+                        ExecutorConfig(model="test-model"),
+                    )
+                ]
+
+            self.assertEqual(published[0][0], "s1")
+            self.assertEqual(published[0][1]["input_tokens"], 30)
+            self.assertEqual(published[0][1]["cache_read_input_tokens"], 70)
+            self.assertEqual(published[0][1]["by_model"]["test-model"]["total_tokens"], 110)
+            turn_complete = next(e for e in events if isinstance(e, TurnComplete))
+            self.assertEqual(turn_complete.usage["input_tokens"], 30)
+            self.assertEqual(turn_complete.usage["cache_read_input_tokens"], 70)
 
         _run(_t())
 

@@ -124,6 +124,21 @@ _PER_TURN_TIMEOUT_S = 120.0
 # Overall budget for following one headless ``-p`` session to idle
 # (first-turn recovery and the extra-turns loop share it).
 _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+_HEADLESS_TIMEOUT_ENV = "OMNIGENT_HEADLESS_TIMEOUT_SECONDS"
+
+
+def _headless_timeout_seconds() -> float | None:
+    """Return the headless wait budget; ``0`` disables the overall limit."""
+    raw = os.environ.get(_HEADLESS_TIMEOUT_ENV)
+    if raw is None:
+        return _LOOP_TIMEOUT_S
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _LOOP_TIMEOUT_S
+    if seconds < 0 or not seconds < float("inf"):
+        return _LOOP_TIMEOUT_S
+    return None if seconds == 0 else seconds
 
 # Optional bearer token for remote omnigent servers that sit
 # behind an auth proxy (for example Databricks Apps). When set, the
@@ -2583,13 +2598,25 @@ async def _query_sessions_once(
         # the transcript read below returns the whole turn's output.
         # An async orchestrator stays ``running`` until its sub-agents
         # and synthesis finish, so this also follows those to idle.
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(_LOOP_TIMEOUT_S):
+        try:
+            timeout_seconds = _headless_timeout_seconds()
+            async with asyncio.timeout(timeout_seconds):
                 while True:
                     await chat.refresh()
                     if chat.status not in ("running", "launching"):
                         break
-                    await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+                    try:
+                        await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+                    except TimeoutError:
+                        continue
+        except TimeoutError:
+            pass
+        await chat.refresh()
+        if chat.status in ("running", "launching"):
+            raise RuntimeError(
+                "Headless turn exceeded its overall wait budget while the "
+                "runner was still working; refusing to return partial output."
+            ) from None
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2649,8 +2676,11 @@ async def _query_sessions_once(
 
     async def _drain_extra_turns() -> None:
         # Probe: collect synthesis text or status events that arrive quickly.
-        probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
-        if probe.text:
+        try:
+            probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
+        except TimeoutError:
+            probe = None
+        if probe is not None and probe.text:
             all_text_parts.append(probe.text)
         # refresh() is the authoritative check: "running" means the runner's
         # relay cache holds "waiting" (sub-agents still running); "idle" means
@@ -2660,7 +2690,13 @@ async def _query_sessions_once(
             return
         # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
-            extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+            try:
+                extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+            except TimeoutError:
+                await chat.refresh()
+                if chat.status not in ("running", "launching"):
+                    return
+                continue
             if extra.text:
                 all_text_parts.append(extra.text)
             await chat.refresh()
@@ -2674,14 +2710,16 @@ async def _query_sessions_once(
         )
 
     try:
-        async with asyncio.timeout(_LOOP_TIMEOUT_S):
+        timeout_seconds = _headless_timeout_seconds()
+        async with asyncio.timeout(timeout_seconds):
             await _drain_extra_turns()
     except asyncio.TimeoutError:
-        logger.warning(
-            "headless -p timed out after %.0fs waiting for session %s to complete",
-            _LOOP_TIMEOUT_S,
-            bound.id,
-        )
+        await chat.refresh()
+        if chat.status in ("running", "launching"):
+            raise RuntimeError(
+                "Headless session exceeded its overall wait budget while the "
+                "runner was still working; refusing to return partial output."
+            ) from None
 
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)

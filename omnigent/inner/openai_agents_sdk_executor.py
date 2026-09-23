@@ -19,8 +19,8 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping, Sequence
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
@@ -696,6 +696,51 @@ class _AgentsSessionState:
     history_cursor: int = 0
     run_item_count_before: int | None = None
     rollback_to_item_count: int | None = None
+    cumulative_usage: dict[str, int] = field(default_factory=dict)
+    usage_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
+
+
+_LIVE_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _completed_response_usage(data: object, model: str) -> dict[str, int | str] | None:
+    """Normalize one SDK ``response.completed`` usage object."""
+    if getattr(data, "type", None) != "response.completed":
+        return None
+    usage = getattr(getattr(data, "response", None), "usage", None)
+    if usage is None:
+        return None
+    total_input = int(getattr(usage, "input_tokens", 0) or 0)
+    output = int(getattr(usage, "output_tokens", 0) or 0)
+    total = int(getattr(usage, "total_tokens", 0) or 0) or total_input + output
+    details = getattr(usage, "input_tokens_details", None)
+    cached = int(getattr(details, "cached_tokens", 0) or 0)
+    if not any((total_input, output, total)):
+        return None
+    result: dict[str, int | str] = {
+        "input_tokens": max(0, total_input - cached),
+        "output_tokens": output,
+        "total_tokens": total,
+        "context_tokens": total,
+        "model": model,
+    }
+    if cached:
+        result["cache_read_input_tokens"] = cached
+    return result
+
+
+def _add_usage(target: dict[str, int], delta: Mapping[str, object]) -> None:
+    """Add standard token counters from *delta* into *target*."""
+    for key in _LIVE_USAGE_FIELDS:
+        value = delta.get(key)
+        if isinstance(value, int) and value >= 0:
+            target[key] = target.get(key, 0) + value
 
 
 # ``_sanitize_replay_item`` walks replay values recursively. At the
@@ -1422,6 +1467,11 @@ class OpenAIAgentsSDKExecutor(Executor):
             instructions=system_prompt or None,
             model=model,
             model_settings=agents_sdk.ModelSettings(
+                # The Agents SDK only enables streamed usage by default for
+                # api.openai.com.  OpenAI-compatible providers such as the
+                # Databricks gateway otherwise return empty ModelResponse
+                # usage objects, so no session token totals are persisted.
+                include_usage=True,
                 parallel_tool_calls=parallel_tool_calls,
                 max_tokens=max_tokens,
                 **_build_reasoning_model_settings(reasoning_effort),
@@ -1595,6 +1645,8 @@ class OpenAIAgentsSDKExecutor(Executor):
         response_text = ""
         saw_tool_activity = False
         final_text = ""
+        incremental_turn_usage: dict[str, int] = {}
+        last_context_tokens: int | None = None
         for attempt in range(_EMPTY_TURN_MAX_ATTEMPTS):
             response_text = ""
             pending_tools: dict[str, tuple[str, float]] = {}
@@ -1640,6 +1692,24 @@ class OpenAIAgentsSDKExecutor(Executor):
                     if event.type == "raw_response_event":
                         raw_event = cast(_RawResponseEvent, event)
                         data = raw_event.data
+                        call_usage = _completed_response_usage(data, model)
+                        if call_usage is not None:
+                            _add_usage(incremental_turn_usage, call_usage)
+                            _add_usage(state.cumulative_usage, call_usage)
+                            model_usage = state.usage_by_model.setdefault(model, {})
+                            _add_usage(model_usage, call_usage)
+                            context = call_usage.get("context_tokens")
+                            if isinstance(context, int):
+                                last_context_tokens = context
+                            from omnigent.runtime.live_usage import publish_live_usage
+
+                            publish_live_usage(
+                                session_key,
+                                {
+                                    **state.cumulative_usage,
+                                    "by_model": state.usage_by_model,
+                                },
+                            )
                         if data.type == "response.output_text.delta":
                             text = data.delta
                             if text:
@@ -1850,7 +1920,13 @@ class OpenAIAgentsSDKExecutor(Executor):
         # back to total_tokens (which sums across ALL sub-turns).
         turn_usage: _JsonObject | None = None
         raw_responses = getattr(result, "raw_responses", None)
-        if raw_responses:
+        if incremental_turn_usage:
+            turn_usage = {
+                **incremental_turn_usage,
+                "context_tokens": last_context_tokens,
+                "model": model,
+            }
+        elif raw_responses:
             in_tok = sum(getattr(r.usage, "input_tokens", 0) or 0 for r in raw_responses)
             out_tok = sum(getattr(r.usage, "output_tokens", 0) or 0 for r in raw_responses)
             total_tok = sum(getattr(r.usage, "total_tokens", 0) or 0 for r in raw_responses)
