@@ -25,6 +25,7 @@ from omnigent.chat import (
     _DaemonChatSession,
     _default_cli_model,
     _extract_agent_name,
+    _headless_timeout_seconds,
     _is_url,
     _materialize_override_bundle,
     _persisted_turn_text,
@@ -72,6 +73,18 @@ def test_is_url_relative() -> None:
 def test_is_url_absolute() -> None:
     """Absolute paths are not URLs."""
     assert _is_url("/home/user/my-agent") is False
+
+
+def test_headless_timeout_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Long unattended jobs can delegate cancellation to their outer runner."""
+    monkeypatch.setenv("OMNIGENT_HEADLESS_TIMEOUT_SECONDS", "0")
+    assert _headless_timeout_seconds() is None
+
+
+def test_invalid_headless_timeout_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed override does not remove the upstream safety bound."""
+    monkeypatch.setenv("OMNIGENT_HEADLESS_TIMEOUT_SECONDS", "not-a-number")
+    assert _headless_timeout_seconds() == chat_module._LOOP_TIMEOUT_S
 
 
 def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4362,6 +4375,48 @@ async def test_query_sessions_once_slow_first_turn_not_truncated(
     )
     assert result is not None
     assert "FULL final answer" in result
+
+
+async def test_query_sessions_once_overall_timeout_rejects_partial_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-running turn must not become an exit-zero partial result."""
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.03)
+    client = _FakeAPClient(
+        [_item_user("finish the kernel"), _item_assistant("still researching")]
+    )
+
+    class _HungTurnChat:
+        status = "running"
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def refresh(self) -> None:
+            pass
+
+        async def query(self, prompt: str) -> QueryResult:
+            return await _never_return(prompt)
+
+        async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            await asyncio.sleep(0.01)
+            return QueryResult(text="", files=[])
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _HungTurnChat)
+    with pytest.raises(RuntimeError, match="refusing to return partial output"):
+        await asyncio.wait_for(
+            _query_sessions_once(
+                client=client,
+                agent_name="hello_world",
+                tool_handler=None,
+                prompt="finish the kernel",
+                session_bundle=b"bundle-bytes",
+                session_bundle_filename="agent.tar.gz",
+                runner_id="runner_test",
+            ),
+            timeout=2,
+        )
 
 
 async def test_persisted_turn_text_anchors_on_last_user_message() -> None:

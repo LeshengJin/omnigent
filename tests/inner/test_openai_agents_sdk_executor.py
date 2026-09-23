@@ -35,6 +35,7 @@ from omnigent.inner.openai_agents_sdk_executor import (
     _normalize_responses_items_for_chat,
     _ReasoningBlockFilterStream,
     _sanitize_replay_item,
+    _wrap_client_for_infinite_rate_limit_retries,
     _wrap_client_for_reasoning_models,
 )
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
@@ -104,6 +105,7 @@ class _FakeRunItemEvent:
 
 @dataclass
 class _FakeModelSettings:
+    include_usage: bool | None = None
     parallel_tool_calls: bool | None = None
     max_tokens: int | None = None
 
@@ -419,6 +421,82 @@ def test_wrap_client_non_streaming_create_not_wrapped() -> None:
     assert isinstance(result, _FakeResult)
 
 
+def test_openai_client_retries_429_until_success() -> None:
+    """A persistent provider throttle outlives the SDK's bounded retry budget."""
+
+    request = httpx.Request("POST", "https://gateway.test/chat/completions")
+    rate_limit = httpx.HTTPStatusError(
+        "rate limited",
+        request=request,
+        response=httpx.Response(429, request=request),
+    )
+
+    class _FakeCalls:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, **kwargs) -> str:
+            self.calls += 1
+            if self.calls < 3:
+                raise rate_limit
+            return str(kwargs["marker"])
+
+    class _FakeChat:
+        def __init__(self) -> None:
+            self.completions = _FakeCalls()
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.chat = _FakeChat()
+            self.responses = _FakeCalls()
+
+    async def _run_inner() -> tuple[str, list[float], int]:
+        client = _FakeClient()
+        original = client.chat.completions
+        sleeps = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with patch("omnigent.inner.openai_agents_sdk_executor._sleep", fake_sleep):
+            _wrap_client_for_infinite_rate_limit_retries(client)
+            result = await client.chat.completions.create(marker="done")
+        return result, sleeps, original.calls
+
+    result, sleeps, calls = _run(_run_inner())
+    assert result == "done"
+    assert sleeps == [60.0, 60.0]
+    assert calls == 3
+
+
+def test_openai_client_does_not_retry_non_429() -> None:
+    """Authentication, quota configuration, and server errors remain bounded."""
+
+    request = httpx.Request("POST", "https://gateway.test/responses")
+    forbidden = httpx.HTTPStatusError(
+        "forbidden",
+        request=request,
+        response=httpx.Response(403, request=request),
+    )
+
+    class _FakeCalls:
+        async def create(self, **kwargs) -> None:
+            del kwargs
+            raise forbidden
+
+    class _FakeClient:
+        responses = _FakeCalls()
+
+    async def _run_inner() -> None:
+        client = _FakeClient()
+        _wrap_client_for_infinite_rate_limit_retries(client)
+        await client.responses.create()
+
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        _run(_run_inner())
+    assert caught.value.response.status_code == 403
+
+
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
     def test_close_closes_owned_client_but_not_injected_client(self):
         class _ClosableClient:
@@ -685,6 +763,29 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
             self.assertEqual(events[-1].response, "done")
             self.assertFalse(_FakeRunner.last_calls[0]["agent"].model_settings.parallel_tool_calls)
+
+        _run(_t())
+
+    def test_streamed_usage_is_requested_for_compatible_providers(self):
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "Be helpful.",
+                    )
+                ]
+
+            self.assertEqual(events[-1].response, "done")
+            self.assertTrue(_FakeRunner.last_calls[0]["agent"].model_settings.include_usage)
 
         _run(_t())
 
@@ -1425,6 +1526,58 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
                 1200,
                 "context_tokens must equal total for single-call turns.",
             )
+
+        _run(_t())
+
+    def test_completed_subcall_publishes_live_cumulative_usage(self):
+        """Usage is visible before the outer agent turn finishes."""
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            completed = types.SimpleNamespace(
+                type="response.completed",
+                response=types.SimpleNamespace(
+                    usage=types.SimpleNamespace(
+                        input_tokens=100,
+                        output_tokens=10,
+                        total_tokens=110,
+                        input_tokens_details=types.SimpleNamespace(cached_tokens=70),
+                    )
+                ),
+            )
+            _FakeRunner.next_result = _FakeResult(
+                events=[_FakeRawEvent(completed)],
+                final_output="done",
+            )
+            published: list[tuple[str, dict[str, object]]] = []
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with (
+                patch(
+                    "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                    return_value=_fake_agents_sdk(),
+                ),
+                patch(
+                    "omnigent.runtime.live_usage.publish_live_usage",
+                    side_effect=lambda session_id, usage: published.append((session_id, usage)),
+                ),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "",
+                        ExecutorConfig(model="test-model"),
+                    )
+                ]
+
+            self.assertEqual(published[0][0], "s1")
+            self.assertEqual(published[0][1]["input_tokens"], 30)
+            self.assertEqual(published[0][1]["cache_read_input_tokens"], 70)
+            self.assertEqual(published[0][1]["by_model"]["test-model"]["total_tokens"], 110)
+            turn_complete = next(e for e in events if isinstance(e, TurnComplete))
+            self.assertEqual(turn_complete.usage["input_tokens"], 30)
+            self.assertEqual(turn_complete.usage["cache_read_input_tokens"], 70)
 
         _run(_t())
 

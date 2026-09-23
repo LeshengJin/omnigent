@@ -1369,8 +1369,11 @@ class HarnessApp:
         :yields: SSE-formatted ``bytes`` ready to ship over the
             HTTP response.
         """
+        from omnigent.runtime.live_activity import publish_live_activity
+
         sequence = 0
         for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
+            publish_live_activity(ctx.session_id, ctx.response_id, initial_event)
             yield _format_sse_event(initial_event)
             sequence += 1
 
@@ -1412,6 +1415,7 @@ class HarnessApp:
                 else:
                     last_event_seq = sequence
                 sequence += 1
+                publish_live_activity(ctx.session_id, ctx.response_id, event)
                 yield _format_sse_event(event)
             terminal = await self._build_terminal_event(
                 ctx, model=model, run_task=run_task, sequence=sequence
@@ -1423,6 +1427,7 @@ class HarnessApp:
             async with self._lock:
                 if self._active_turn_ctx is ctx:
                     self._active_turn_ctx = None
+            publish_live_activity(ctx.session_id, ctx.response_id, terminal)
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
